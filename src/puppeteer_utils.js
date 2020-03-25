@@ -1,6 +1,7 @@
 const puppeteer = require("puppeteer");
 const _ = require("highland");
 const url = require("url");
+const queryString = require('querystring');
 const mapStackTrace = require("sourcemapped-stacktrace-node").default;
 const path = require("path");
 const fs = require("fs");
@@ -106,9 +107,9 @@ const enableLogging = opt => {
  * @return {Promise<Array<string>>}
  */
 const getLinks = async opt => {
-  const { page } = opt;
-  const anchors = await page.evaluate(() =>
-    Array.from(document.querySelectorAll("a,link[rel='alternate']")).map(anchor => {
+  const { page, queryStrings } = opt;
+  let anchors = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("a")).map(anchor => {
       if (anchor.href.baseVal) {
         const a = document.createElement("a");
         a.href = anchor.href.baseVal;
@@ -117,6 +118,33 @@ const getLinks = async opt => {
       return anchor.href;
     })
   );
+
+  if (Object.keys(queryStrings).some((queryStringUrl) => page.url().includes(queryStringUrl)) && !page.url().includes('?')) {
+    let queryParameters;
+    const queryStringsToApplyKey = Object.keys(queryStrings).find((queryStringUrl) => page.url().includes(queryStringUrl));
+
+    const queryStringsToApply = queryStrings[queryStringsToApplyKey];
+
+    const keyList = Object.keys(queryStringsToApply);
+    keyList.forEach((key) => {
+      const localQueryParams = queryStringsToApply[key].map((value) => ({ [key]: value }));
+      if (!queryParameters) {
+        queryParameters = localQueryParams;
+      } else {
+        if (localQueryParams.length > queryParameters.length) {
+          queryParameters = localQueryParams.map((localQueryParam) => 
+            queryParameters.map((queryParam) => ({ ...queryParam, ...localQueryParam }))
+          ).flat();
+        } else {
+          queryParameters = queryParameters.map((localQueryParam) => 
+            localQueryParams.map((queryParam) => ({ ...queryParam, ...localQueryParam }))
+          ).flat();
+        }
+      }
+    });
+
+    anchors = anchors.concat(queryParameters.map((queryParams) => `${page.url()}?${queryString.stringify(queryParams)}`));
+  } 
 
   const iframes = await page.evaluate(() =>
     Array.from(document.querySelectorAll("iframe")).map(iframe => iframe.src)
@@ -138,10 +166,15 @@ const crawl = async opt => {
     afterFetch,
     onEnd,
     publicPath,
-    sourceDir
+    sourceDir    
   } = opt;
   let shuttingDown = false;
   let streamClosed = false;
+
+  const { queryStrings } = options;
+
+  let queryStringAllowed = queryStrings && Object.keys(queryStrings);
+  queryStringAllowed = queryStringAllowed || [];
 
   const onSigint = () => {
     if (shuttingDown) {
@@ -168,23 +201,22 @@ const crawl = async opt => {
   const uniqueUrls = new Set();
   const sourcemapStore = {};
 
+  const searchAllowed = url => {
+    return queryStringAllowed.some((allowedUrl) => url.includes(allowedUrl));
+  }
+
   /**
    * @param {string} path
    * @returns {void}
    */
   const addToQueue = newUrl => {
-    const { hostname, search, hash, port } = url.parse(newUrl);
-    newUrl = newUrl.replace(`${search || ""}${hash || ""}`, "");
-
-    // Ensures that only link on the same port are crawled
-    //
-    // url.parse returns a string,
-    // but options port is passed by a user and default value is a number
-    // we are converting both to string to be sure
-    // Port can be null, therefore we need the null check
-    const isOnAppPort = port && port.toString() === options.port.toString();
-
-    if (hostname === "localhost" && isOnAppPort && !uniqueUrls.has(newUrl) && !streamClosed) {
+    const { hostname, search, hash } = url.parse(newUrl);
+    if (searchAllowed(newUrl)) {
+      newUrl = newUrl.replace(`${hash || ""}`, "");
+    } else {
+      newUrl = newUrl.replace(`${search || ""}${hash || ""}`, "");
+    }
+    if (hostname === "localhost" && !uniqueUrls.has(newUrl) && !streamClosed) {
       uniqueUrls.add(newUrl);
       enqued++;
       queue.write(newUrl);
@@ -206,7 +238,7 @@ const crawl = async opt => {
    * @param {string} pageUrl
    * @returns {Promise<string>}
    */
-  const fetchPage = async pageUrl => {
+  const fetchPage = async (pageUrl, queryStrings) => {
     const route = pageUrl.replace(basePath, "");
 
     let skipExistingFile = false;
@@ -247,7 +279,7 @@ const crawl = async opt => {
         }
         if (options.waitFor) await page.waitFor(options.waitFor);
         if (options.crawl) {
-          const links = await getLinks({ page });
+          const links = await getLinks({ page, queryStrings });
           links.forEach(addToQueue);
         }
         afterFetch && (await afterFetch({ page, route, browser, addToQueue }));
@@ -277,7 +309,7 @@ const crawl = async opt => {
 
   return new Promise((resolve, reject) => {
     queue
-      .map(x => _(fetchPage(x)))
+      .map(x => _(fetchPage(x, queryStrings)))
       .mergeWithLimit(options.concurrency)
       .toArray(async () => {
         process.removeListener("SIGINT", onSigint);
